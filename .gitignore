@@ -6,3 +6,5 @@ bee_dataset/
 bee_dataset_1080p/
 runs/
 bus.jpg
+venv/
+.vscode/

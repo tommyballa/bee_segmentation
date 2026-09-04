@@ -4,26 +4,27 @@ from ultralytics import YOLO
 
 def main():
     # 1. Carica il modello base (che vogliamo migliorare con il fine-tuning)
-    model = YOLO("yolo26n-seg.pt")
+    model = YOLO("yolo26s-seg.pt")
     print("Inizio il Fine-Tuning di YOLO con le etichette create da LangSAM...")
     
     # 2. Avvia l'addestramento
     # Assicurati che nel data.yaml i percorsi alle cartelle train/val siano corretti.
     results = model.train(
-        data="bee_dataset/data.yaml", # Il file di configurazione del dataset
+        data="data.yaml",             # Il file di configurazione del dataset
         epochs=50,                    # Numero di epoche (cicli) di addestramento
-        imgsz=800,                    # Risoluzione alta per api piccole
-        batch=1,                      # Abbassato a 1 per evitare errori di memoria OOM
+        imgsz=1080,                    # Risoluzione alta per api piccole
+        batch=4,                      # Abbassato per avere più iterazioni ed evitare OOM
         device=0,                     # Usa la GPU primaria
-        half=True,                    # FONDAMENTALE PER LA TUA GPU! Dimezza l'uso della VRAM senza perdere precisione.
-        workers=2,                    # FONDAMENTALE SU WINDOWS! Evita che la CPU si ingolfi e faccia bloccare tutto il pc durante il training.
+        workers=2,                    # FONDAMENTALE SU WINDOWS
         project="runs/segment",       
-        name="bee_model_finetuned",   
-        patience=10                   
+        name="bee_model_finetuned_yolo26s",   
+        patience=20,                  # Alzato un po' per dare più tempo al modello di imparare
+        lr0=0.001,                    # Learning rate ridotto per evitare instabilità/NaN con il modello 's'
+        optimizer='auto'              # Ottimizzatore automatico
     )
     
     print("\n Addestramento completato!")
-    print("I pesi finali del tuo nuovo modello personalizzato si trovano in: runs/segment/bee_model_finetuned/weights/best.pt")
+    print("I pesi finali del tuo nuovo modello personalizzato si trovano in: runs/segment/bee_model_finetuned_yolo26s/weights/best.pt")
 
 if __name__ == "__main__":
     main()

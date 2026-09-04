@@ -2,11 +2,15 @@ import cv2
 import os
 import numpy as np
 
-image_dir = 'bee_dataset/images/train'
-label_dir = 'bee_dataset/labels/train'
+image_dir = '/home/tommaso_ballarin/bees_datasets/DatasetApi_Ceschi/train/images'
+label_dir = '/home/tommaso_ballarin/bees_datasets/DatasetApi_Ceschi/train/labels'
+output_dir = 'visualizations'
 
-print("Premi SPAZIO per passare alla prossima immagine, o ESC per uscire.")
+os.makedirs(output_dir, exist_ok=True)
+print(f"Salvataggio delle visualizzazioni nella cartella '{output_dir}'...")
 
+# Prendi solo le prime 50 immagini per non riempire la cartella inutilmente, o togli il counter per farle tutte
+count = 0
 for img_name in os.listdir(image_dir):
     if not img_name.lower().endswith(('.jpg', '.jpeg', '.png')):
         continue
@@ -15,7 +19,6 @@ for img_name in os.listdir(image_dir):
     label_path = os.path.join(label_dir, os.path.splitext(img_name)[0] + '.txt')
     
     if not os.path.exists(label_path):
-        print(f"Nessuna etichetta per {img_name}")
         continue
         
     # Leggi l'immagine con OpenCV
@@ -53,16 +56,12 @@ for img_name in os.listdir(image_dir):
         # Disegna il bordo del poligono
         cv2.polylines(image, [points_np], isClosed=True, color=(0, 255, 0), thickness=2)
 
-    # Ridimensiona l'immagine per farla stare bene nello schermo (larghezza 800px)
-    display_w = 800
-    display_h = int(display_w * (h / w))
-    resized_img = cv2.resize(image, (display_w, display_h))
+    # Salva l'immagine
+    out_path = os.path.join(output_dir, img_name)
+    cv2.imwrite(out_path, image)
     
-    cv2.imshow('Bee Masks', resized_img)
-    
-    # Aspetta un tasto premuto dall'utente
-    key = cv2.waitKey(0)
-    if key == 27: # Se premi ESC (codice 27), esci dal programma
+    count += 1
+    if count >= 30: # Limite di 30 immagini per verificare che le labels siano giuste
         break
 
-cv2.destroyAllWindows()
+print(f"Completato! Ho salvato {count} immagini in {output_dir}/")

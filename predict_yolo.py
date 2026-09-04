@@ -4,10 +4,10 @@ from ultralytics import YOLO
 def main():
     # Carica i pesi salvati all'ultima epoca (32) del tuo addestramento
     # Ho corretto il percorso che per qualche motivo aveva un doppio "runs/segment"
-    model = YOLO("runs/segment/runs/segment/bee_model_finetuned-5/weights/best.pt")
+    model = YOLO("runs/segment/runs/segment/bee_model_finetuned_yolo26s/weights/best.pt")
 
     # Invece di una singola immagine, passiamo l'intera cartella di validazione!
-    test_dir = "bee_dataset/images/val" 
+    test_dir = "/home/tommaso_ballarin/bees_datasets/DatasetApi_Ceschi/test/images" 
     
     # Assicuriamoci che la cartella esista prima di procedere
     if not os.path.exists(test_dir):
@@ -17,10 +17,10 @@ def main():
     import cv2
     import glob
 
-    print(f"Eseguendo il TUO modello addestrato fino all'epoca 32 su tutto il validation set: {test_dir}")
+    print(f"Eseguendo il modello addestrato: {test_dir}")
     
     # Creiamo la cartella di output
-    out_dir = "runs/segment/predict_resized"
+    out_dir = "runs/segment/predict_resized_yolo26s"
     os.makedirs(out_dir, exist_ok=True)
     
     # Processiamo le immagini una per una ridimensionandole
@@ -31,15 +31,14 @@ def main():
         img = cv2.imread(img_path)
         if img is None: continue
         
-        # Ridimensioniamo le immagini giganti per evitare OOM durante il disegno delle maschere
-        MAX_DIM = 1200
+        MAX_DIM = 2000
         h, w = img.shape[:2]
         if max(h, w) > MAX_DIM:
             scale = MAX_DIM / max(h, w)
             img = cv2.resize(img, (int(w * scale), int(h * scale)))
             
         # Predizione sull'immagine ridimensionata
-        results = model.predict(source=img, save=False, show=False, conf=0.10)        
+        results = model.predict(source=img, save=False, show=False, conf=0.10, max_det=2000)        
         
         # Filtriamo le predizioni calcolando l'area MEDIANA delle api (come nel tuo pass1 di SAM)
         if len(results) > 0 and len(results[0].boxes) > 0:
@@ -56,8 +55,8 @@ def main():
             import numpy as np
             median_area = np.median(areas)
             
-            # 3. La soglia minima sarà il 15% dell'area media di un'ape in QUESTA specifica foto
-            MIN_AREA = median_area * 0.30
+            # 3. La soglia minima sarà il x% dell'area media di un'ape in QUESTA specifica foto
+            MIN_AREA = median_area * 0.6
             print(f"[{img_name}] Area mediana: {median_area:.0f} px -> Scarto tutto sotto i {MIN_AREA:.0f} px")
             
             for i, area in enumerate(areas):
