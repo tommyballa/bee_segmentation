@@ -31,7 +31,7 @@ def main():
         
         # Facciamo inferenza alla massima risoluzione per prendere bene i bordi
         # Soglia di confidenza BASSA: estraiamo tutto, sarà cleaning_and_clustering a filtrare
-        results = model.predict(source=img, save=False, show=False, conf=0.05, imgsz=1920)
+        results = model.predict(source=img, save=False, show=False, conf=0.05, imgsz=1920, max_det=2000)
         
         if len(results) == 0 or results[0].masks is None:
             continue

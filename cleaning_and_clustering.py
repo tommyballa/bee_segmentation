@@ -5,7 +5,6 @@ import shutil
 import numpy as np
 import torch
 import torchvision.transforms as T
-from torchvision.models import resnet18, ResNet18_Weights
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 
@@ -22,8 +21,10 @@ MIN_CONFIDENCE = 0.35       # Confidenza minima di YOLO (letta dal nome file)
 # ============================================================
 # PARAMETRI DI CLUSTERING
 # ============================================================
-NUM_CLUSTERS = 4            # Numero di cluster per KMeans
+FEATURE_EXTRACTOR = "dinov2"  # "dinov2" (consigliato per clustering semantico) oppure "resnet18"
+NUM_CLUSTERS = 5            # Numero di cluster per KMeans
 PCA_COMPONENTS = 50         # Componenti PCA per ridurre le feature
+BATCH_SIZE = 64             # Dimensione del batch per estrazione feature su GPU
 
 # ============================================================
 # FUNZIONI DI PULIZIA
@@ -162,12 +163,15 @@ def run_pipeline(input_dir, output_dir):
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Carichiamo ResNet18 senza la testa di classificazione per estrarre feature
-    model = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
-    model.fc = torch.nn.Identity()
+    # Carichiamo DINOv2 (ViT-S/14) per estrarre feature visive
+    # DINOv2 è addestrato in modo self-supervised: cattura forma, texture e struttura
+    # molto meglio di ResNet18 ImageNet per il clustering di oggetti simili
+    print("Caricamento modello DINOv2 (ViT-S/14)...")
+    model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
     model.to(device)
     model.eval()
     
+    # DINOv2 usa la stessa normalizzazione ImageNet ma a 224x224
     transform = T.Compose([
         T.ToPILImage(),
         T.Resize((224, 224)),
