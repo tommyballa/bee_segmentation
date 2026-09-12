@@ -4,10 +4,10 @@ from ultralytics import YOLO
 def main():
     # Carica i pesi salvati all'ultima epoca (32) del tuo addestramento
     # Ho corretto il percorso che per qualche motivo aveva un doppio "runs/segment"
-    model = YOLO("runs/segment/runs/segment/bee_model_finetuned_yolo26s/weights/best.pt")
+    model = YOLO("runs/segment/runs/segment/bee_model_finetuned_yolo26s_newdomain/weights/best.pt")
 
     # Invece di una singola immagine, passiamo l'intera cartella di validazione!
-    test_dir = "/home/tommaso_ballarin/bees_datasets/DatasetApi_Ceschi/test/images" 
+    test_dir = "/mnt/disk1/borsattifr/datasets/bees_datasets/DatasetApi_Ceschi/processed/test/images"
     
     # Assicuriamoci che la cartella esista prima di procedere
     if not os.path.exists(test_dir):
@@ -20,7 +20,7 @@ def main():
     print(f"Eseguendo il modello addestrato: {test_dir}")
     
     # Creiamo la cartella di output
-    out_dir = "runs/segment/predict_resized_yolo26s"
+    out_dir = "runs/segment/predict_resized_yolo26s_newdomain"
     os.makedirs(out_dir, exist_ok=True)
     
     # Processiamo le immagini una per una ridimensionandole

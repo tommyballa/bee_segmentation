@@ -4,189 +4,216 @@ la maschera di anomalia per-ape per le metriche di anomaly detection.
 
 Pipeline:
 1. Carica l'immagine sintetica e la GT mask della varroa (generati da varroa_generator.py)
-2. Usa le label YOLO segmentation originali (poligoni delle api) per croppare ogni ape
-3. Per ogni crop, incrocia la GT mask varroa con il poligono dell'ape
-4. Salva:
-   - Il crop dell'ape (224x224, sfondo nero, come extract_anomaly_dataset.py)
-   - La maschera anomalia per-ape (224x224, bianco=varroa, nero=normale)
+2. Usa l'inferenza del modello YOLO per trovare e croppare ogni ape
+3. Estrae la maschera del poligono grezzo dell'ape
+4. Passa l'immagine grezza e la maschera a dataset_cleaning.clean_and_filter per la pipeline unificata di sanificazione, rotazione, sfumatura bordi
+5. Incrocia la GT mask varroa pulita con la nuova immagine
+6. Salva:
+   - Il crop dell'ape (512x512, sfondo nero, perfettamente smussato e orientato)
+   - La maschera anomalia per-ape (512x512, bianco=varroa, nero=normale)
    - Un label (0=normale, 1=anomala) in un file CSV
-
-Output:
-  anomaly_dataset_synthetic/
-    normal/          → api senza varroa (solo immagine, maschera tutta nera)
-    anomalous/       → api con varroa (immagine + maschera)
-    masks/           → maschere GT di anomalia per ogni ape anomala
-    labels.csv       → bee_id, label (0/1), image_path, mask_path
 """
 
 import os
 import cv2
 import csv
 import numpy as np
+from ultralytics import YOLO
+# Importiamo la funzione aggiornata dal nuovo script di pulizia ottimizzato
+from dataset_cleaning import clean_and_filter, refine_raw_polygon_mask, normalize_orientation, normalize_scale, feather_edges
 
 
 # --- Configurazione ---
 # Cartella con le immagini sintetiche e maschere generate da varroa_generator.py
-SYNTHETIC_DIR = "/home/tommaso_ballarin/bee_segmentation/bee_segmentation/varroa_synthetic_image"
+SYNTHETIC_DIR = "/mnt/disk1/borsattifr/datasets/bees_datasets/DatasetApi_Ceschi/processed/test/synthetic_varroa_output_v2/images"
 
-# Label YOLO segmentation originali (poligoni delle api)
-LABELS_DIR = "/home/tommaso_ballarin/bees_datasets/DatasetApi_Ceschi/train/labels"
+# Modello YOLO per la segmentazione (lo stesso usato in extract_anomaly_dataset.py)
+YOLO_MODEL_PATH = "runs/segment/runs/segment/bee_model_finetuned_yolo26s-2/weights/best.pt"
 
 # Output
-OUTPUT_BASE = "/home/tommaso_ballarin/bees_datasets/DatasetApi_Ceschi/anomaly_dataset_synthetic"
+OUTPUT_BASE = "/mnt/disk1/borsattifr/datasets/bees_datasets/DatasetApi_Ceschi/processed/test_single_bee"
 OUTPUT_NORMAL = os.path.join(OUTPUT_BASE, "normal")
 OUTPUT_ANOMALOUS = os.path.join(OUTPUT_BASE, "anomalous")
 OUTPUT_MASKS = os.path.join(OUTPUT_BASE, "masks")
 
-# Dimensione finale dei crop (come PatchCore / MVTec)
-CROP_SIZE = 224
-
-# Padding attorno alla bounding box dell'ape
-PADDING = 10
+# Padding iniziale abbondante per non tagliare l'ape durante le rotazioni e pulizie
+PADDING = 30
 
 # Soglia minima di pixel varroa per considerare l'ape anomala
 # (evita falsi positivi da overlap di 1-2 pixel al bordo)
 MIN_VARROA_PIXELS = 10
 
 
-def parse_yolo_segmentation_labels(label_path, img_w, img_h):
+def crop_raw_bee(image, varroa_full_mask, polygon_pts, bbox):
     """
-    Legge le label YOLO segmentation: ogni riga è
-       class_id x1 y1 x2 y2 ... xN yN
-    dove le coordinate sono normalizzate [0,1].
-    """
-    detections = []
-    with open(label_path, "r") as f:
-        for line in f:
-            parts = line.strip().split()
-            if len(parts) < 7:
-                continue
-
-            coords = list(map(float, parts[1:]))
-            if len(coords) % 2 != 0:
-                continue
-
-            points = []
-            for i in range(0, len(coords), 2):
-                px = coords[i] * img_w
-                py = coords[i + 1] * img_h
-                points.append([px, py])
-
-            polygon = np.array(points, dtype=np.float32)
-
-            x_min, y_min = polygon.min(axis=0)
-            x_max, y_max = polygon.max(axis=0)
-            bbox = (int(x_min), int(y_min), int(x_max - x_min), int(y_max - y_min))
-
-            detections.append({
-                "polygon": polygon,
-                "bbox": bbox,
-            })
-
-    return detections
-
-
-def crop_and_square(image, mask, polygon_pts, bbox, crop_size=224, padding=10):
-    """
-    Croppa l'ape dall'immagine e dalla maschera varroa.
-
-    1. Crea una maschera del poligono dell'ape
-    2. Applica la maschera all'immagine (sfondo nero)
-    3. Incrocia la maschera varroa con il poligono (solo varroa DENTRO l'ape)
-    4. Fa il crop quadrato centrato e ridimensiona a crop_size x crop_size
-
-    Returns:
-        bee_crop: immagine dell'ape (crop_size x crop_size x 3)
-        varroa_crop: maschera varroa per questa ape (crop_size x crop_size, 0 o 255)
-        num_varroa_px: numero di pixel varroa dentro questa ape
+    Estrae il ritaglio grezzo dell'ape e della maschera varroa.
+    Non applica operazioni morfologiche (vengono fatte da dataset_cleaning).
     """
     h, w = image.shape[:2]
     bx, by, bw, bh = bbox
 
-    # Crea maschera del poligono dell'ape (full size)
+    # Crea maschera grezza del poligono dell'ape (full size)
     bee_mask = np.zeros((h, w), dtype=np.uint8)
     pts = polygon_pts.astype(np.int32).reshape((-1, 1, 2))
     cv2.fillPoly(bee_mask, [pts], 255)
 
-    # Incrocia maschera varroa con maschera ape → varroa solo dentro l'ape
-    varroa_in_bee = cv2.bitwise_and(mask, bee_mask)
+    # Bounding box con padding generoso per permettere rotazioni successive in cleaning
+    x1 = max(0, bx - PADDING)
+    y1 = max(0, by - PADDING)
+    x2 = min(w, bx + bw + PADDING)
+    y2 = min(h, by + bh + PADDING)
 
-    # Conta pixel varroa dentro questa ape
-    num_varroa_px = cv2.countNonZero(varroa_in_bee)
+    # Crop
+    img_crop = image[y1:y2, x1:x2].copy()
+    bee_mask_crop = bee_mask[y1:y2, x1:x2].copy()
+    varroa_mask_crop = varroa_full_mask[y1:y2, x1:x2].copy()
 
-    # Bounding box con padding
-    x1 = max(0, bx - padding)
-    y1 = max(0, by - padding)
-    x2 = min(w, bx + bw + padding)
-    y2 = min(h, by + bh + padding)
-
-    # Crop immagine con maschera ape (sfondo nero)
-    bee_masked = cv2.bitwise_and(image, image, mask=bee_mask)
-    img_crop = bee_masked[y1:y2, x1:x2].copy()
-    varroa_crop = varroa_in_bee[y1:y2, x1:x2].copy()
-
-    # Rendi quadrato e centrato
-    crop_h, crop_w = img_crop.shape[:2]
-    sq_size = max(crop_w, crop_h)
-
-    square_img = np.zeros((sq_size, sq_size, 3), dtype=np.uint8)
-    square_mask = np.zeros((sq_size, sq_size), dtype=np.uint8)
-
-    off_x = (sq_size - crop_w) // 2
-    off_y = (sq_size - crop_h) // 2
-
-    square_img[off_y:off_y + crop_h, off_x:off_x + crop_w] = img_crop
-    square_mask[off_y:off_y + crop_h, off_x:off_x + crop_w] = varroa_crop
-
-    # Ridimensiona a dimensione finale
-    bee_final = cv2.resize(square_img, (crop_size, crop_size), interpolation=cv2.INTER_AREA)
-    mask_final = cv2.resize(square_mask, (crop_size, crop_size), interpolation=cv2.INTER_NEAREST)
-
-    return bee_final, mask_final, num_varroa_px
+    return img_crop, bee_mask_crop, varroa_mask_crop
 
 
-def process_synthetic_image(syn_img_path, mask_path, label_path):
+def process_synthetic_image(syn_img_path, mask_path, model):
     """
     Processa una singola immagine sintetica: estrae tutte le api e le classifica
     come normali o anomale in base alla sovrapposizione con la maschera varroa.
-
-    Returns:
-        list of (bee_crop, varroa_mask_crop, is_anomalous, source_name, bee_idx)
+    Integra in maniera totale la pipeline di dataset_cleaning.
     """
     syn_img = cv2.imread(syn_img_path)
     varroa_mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
 
     if syn_img is None:
         print(f"  ✗ Impossibile caricare: {syn_img_path}")
-        return []
+        return [], 0
     if varroa_mask is None:
         print(f"  ✗ Impossibile caricare maschera: {mask_path}")
-        return []
-
-    H, W = syn_img.shape[:2]
+        return [], 0
 
     # Binarizza la maschera (potrebbe avere artefatti JPEG)
     _, varroa_mask = cv2.threshold(varroa_mask, 128, 255, cv2.THRESH_BINARY)
 
-    # Leggi i poligoni delle api
-    detections = parse_yolo_segmentation_labels(label_path, W, H)
+    # Inferenza con YOLO (stessi parametri di extract_anomaly_dataset.py)
+    results = model.predict(source=syn_img, save=False, show=False, conf=0.35, imgsz=1920, max_det=2000)
+    
+    detections = []
+    if len(results) > 0 and results[0].masks is not None:
+        res = results[0]
+        boxes = res.boxes.xyxy.cpu().numpy().astype(int)
+        for i, box in enumerate(boxes):
+            polygon = res.masks.xy[i]
+            if len(polygon) == 0:
+                continue
+            x1, y1, x2, y2 = box
+            detections.append({
+                "polygon": polygon,
+                "bbox": (x1, y1, x2 - x1, y2 - y1),
+                "conf": res.boxes.conf.cpu().numpy()[i]
+            })
 
     base_name = os.path.splitext(os.path.basename(syn_img_path))[0]
-    results = []
+    processed_results = []
+    discarded = 0
 
     for i, det in enumerate(detections):
-        bee_crop, varroa_crop, n_px = crop_and_square(
-            syn_img, varroa_mask, det["polygon"], det["bbox"],
-            crop_size=CROP_SIZE, padding=PADDING
+        # 1. Estrarre il crop grezzo (immagine, maschera ape, maschera varroa)
+        img_crop, bee_mask_crop, varroa_mask_crop = crop_raw_bee(
+            syn_img, varroa_mask, det["polygon"], det["bbox"]
         )
 
-        is_anomalous = n_px >= MIN_VARROA_PIXELS
-        results.append((bee_crop, varroa_crop, is_anomalous, base_name, i))
+        dummy_filename = f"bee_{i:05d}_conf{det['conf']:.2f}.png"
 
-    return results
+        # 2. Dato che dobbiamo applicare le stesse rotazioni e scale anche
+        #    alla maschera varroa, non possiamo chiamare "clean_and_filter" 
+        #    così com'è, perché scarterebbe la maschera varroa.
+        #    Replichiamo quindi la pipeline di clean_and_filter applicando 
+        #    le trasformazioni in parallelo su bee_mask e varroa_mask.
+        
+        # Filtro 1: Confidenza YOLO
+        if det['conf'] < 0.35:
+            discarded += 1
+            continue
+            
+        # Raffinamento maschera ape
+        refined_bee_mask = refine_raw_polygon_mask(bee_mask_crop)
+        
+        # Intersechiamo la maschera varroa grezza con l'ape (così varroa fuori dall'ape viene ignorata)
+        varroa_mask_crop = cv2.bitwise_and(varroa_mask_crop, refined_bee_mask)
+        
+        # Passiamo al blocco di pulizia interno di clean_and_filter chiamandolo normalmente per
+        # avere l'ape pulita e capire se viene scartata
+        cleaned_bee = clean_and_filter(img_crop, bee_mask_crop, is_raw_polygon=True, filename=dummy_filename)
+        
+        if cleaned_bee is None:
+            discarded += 1
+            continue
+
+        # Poiché clean_and_filter non trasforma anche la varroa_mask_crop con le stesse matrici,
+        # applichiamo manualmente rotazione e scaling della pulizia alla varroa_mask_crop per tenerla allineata!
+        
+        # Riapplichiamo le trasformazioni necessarie alla varroa per combaciare con cleaned_bee.
+        # A questo punto sappiamo che clean_and_filter estrae un contour, lo smussa, fa bitwise_and, CLAHE,
+        # e poi usa normalize_orientation e normalize_scale.
+        
+        # Per avere l'allineamento 1:1, otteniamo la nuova maschera esatta di "cleaned_bee"
+        gray = cv2.cvtColor(cleaned_bee, cv2.COLOR_BGR2GRAY)
+        _, final_bee_mask = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
+        
+        # ORA: la maschera varroa grezza (varroa_mask_crop) è nel sistema di coordinate del crop iniziale (img_crop).
+        # Cleaned bee ha subito rotazione e scala. 
+        # Per essere perfetti e replicare il flusso, estraiamo la logica di normalizzazione geometrica:
+        
+        # ====================
+        # RIPRODUCIAMO LE TRASFORMAZIONI GEOMETRICHE SULLA VARROA
+        # Dato che clean_and_filter incapsula queste trasformazioni, dobbiamo riprodurle qui
+        # o ricostruire la maschera varroa trasformata.
+        # ====================
+        
+        # Dalla riga ~173-250 di dataset_cleaning.py, sappiamo quali operazioni di pulizia subisce la maschera
+        # Ripercorriamo lo stesso path per la maschera (senza l'immagine che abbiamo già tramite clean_and_filter):
+        open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        opened_mask = cv2.morphologyEx(refined_bee_mask, cv2.MORPH_OPEN, open_kernel)
+        contours, _ = cv2.findContours(opened_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours: 
+            continue
+        largest_contour = max(contours, key=cv2.contourArea)
+        clean_mask = np.zeros_like(refined_bee_mask)
+        cv2.drawContours(clean_mask, [largest_contour], -1, 255, thickness=cv2.FILLED)
+        dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+        clean_mask = cv2.dilate(clean_mask, dilate_kernel, iterations=1)
+        clean_mask = cv2.bitwise_and(clean_mask, refined_bee_mask)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        clean_mask = cv2.morphologyEx(clean_mask, cv2.MORPH_CLOSE, kernel)
+        
+        # Smoothing contorni per la maschera master
+        clean_mask = cv2.GaussianBlur(clean_mask, (31, 31), 0)
+        _, clean_mask = cv2.threshold(clean_mask, 127, 255, cv2.THRESH_BINARY)
+        
+        # 1. Orientamento. Dobbiamo ruotare sia l'immagine "dummy" (usiamo la varroa) sia la maschera.
+        # Creiamo un'immagine varroa BGR fake per usare le funzioni esistenti
+        varroa_bgr = cv2.cvtColor(varroa_mask_crop, cv2.COLOR_GRAY2BGR)
+        
+        varroa_rotated, mask_rotated = normalize_orientation(varroa_bgr, clean_mask)
+        
+        # 2. Scala. 
+        varroa_scaled, _ = normalize_scale(varroa_rotated, mask_rotated, target_size=512, target_fill=0.60)
+        
+        # Convertiamo di nuovo varroa_scaled in GRAY
+        varroa_final_mask = cv2.cvtColor(varroa_scaled, cv2.COLOR_BGR2GRAY)
+        
+        # Intersezione finale per sicurezza con l'ape finale (rimuove varroa scappata dai bordi smussati)
+        varroa_final_mask = cv2.bitwise_and(varroa_final_mask, final_bee_mask)
+
+        # Ricalcola i pixel di varroa effettivi rimasti nella maschera trasformata
+        n_px = cv2.countNonZero(varroa_final_mask)
+        is_anomalous = n_px >= MIN_VARROA_PIXELS
+        
+        processed_results.append((cleaned_bee, varroa_final_mask, is_anomalous, base_name, i))
+
+    return processed_results, discarded
 
 
 def main():
+    print(" Caricamento del modello YOLO...")
+    model = YOLO(YOLO_MODEL_PATH)
+    
     # Crea le cartelle di output
     for d in [OUTPUT_NORMAL, OUTPUT_ANOMALOUS, OUTPUT_MASKS]:
         os.makedirs(d, exist_ok=True)
@@ -194,7 +221,7 @@ def main():
     # Trova tutte le coppie (immagine sintetica, maschera GT)
     syn_files = sorted([
         f for f in os.listdir(SYNTHETIC_DIR)
-        if f.endswith(".jpg") and "_syn_" in f
+        if f.endswith(".jpg") and "_syn" in f
     ])
 
     if not syn_files:
@@ -204,29 +231,23 @@ def main():
     csv_rows = []
     total_normal = 0
     total_anomalous = 0
+    total_discarded = 0
+
+    mask_dir = os.path.join(os.path.dirname(SYNTHETIC_DIR), "masks")
 
     for syn_file in syn_files:
         # Derive mask filename: DSC_4914_syn_0.jpg → DSC_4914_mask_0.png
-        mask_file = syn_file.replace("_syn_", "_mask_").replace(".jpg", ".png")
+        mask_file = syn_file.replace("_syn", "_mask").replace(".jpg", ".png")
         syn_path = os.path.join(SYNTHETIC_DIR, syn_file)
-        mask_path = os.path.join(SYNTHETIC_DIR, mask_file)
+        mask_path = os.path.join(mask_dir, mask_file)
 
         if not os.path.exists(mask_path):
             print(f"  ✗ Maschera non trovata: {mask_path}")
             continue
 
-        # Derive label file: DSC_4914_syn_0.jpg → DSC_4914.txt
-        # Estraiamo il nome originale prima di _syn_
-        original_name = syn_file.split("_syn_")[0]
-        label_file = original_name + ".txt"
-        label_path = os.path.join(LABELS_DIR, label_file)
-
-        if not os.path.exists(label_path):
-            print(f"  ✗ Label non trovata: {label_path}")
-            continue
-
         print(f"\nProcesso: {syn_file}")
-        results = process_synthetic_image(syn_path, mask_path, label_path)
+        results, discarded = process_synthetic_image(syn_path, mask_path, model)
+        total_discarded += discarded
 
         for bee_crop, varroa_crop, is_anomalous, base_name, bee_idx in results:
             bee_id = f"{base_name}_bee_{bee_idx:04d}"
@@ -257,6 +278,7 @@ def main():
     print(f"✅ Estrazione completata!")
     print(f"   Api normali:  {total_normal}")
     print(f"   Api anomale:  {total_anomalous}")
+    print(f"   Api scartate (pulizia): {total_discarded}")
     print(f"   CSV labels:   {csv_path}")
     print(f"   Output dir:   {OUTPUT_BASE}")
     print(f"{'='*60}")
